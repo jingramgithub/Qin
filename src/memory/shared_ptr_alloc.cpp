@@ -1,79 +1,23 @@
+/*
+make_shared<T> 如果T的大小<8B，那么总共需要8+16=24B；如果T的大小>8B，那么总共需要sizeof<T>+16B
+控制块里面可能是有两个atomic<unsigned long>，需要16字节。
+如果使用alloc_shared，控制块的大小会更大一些，似乎控制块的大小不是固定的。
+*/
+
 #include <iostream>
 #include <typeinfo>
 #include <memory>
 #include <memory_resource>
 #include <new>
-#include <cstdio>
+#include <istream>
 #include <cstdlib>
 
-class TrackNew {
-public:
-    static void reset() {
-        numMalloc = 0;
-        sumSize = 0;
-    }
-
-    static size_t totalSize() { return sumSize; }
-    static int totalNumMalloc() { return numMalloc; }
-
-    static void* allocate(std::size_t size, std::size_t align, const char* call) {
-        ++numMalloc;
-        sumSize += size;
-        void* p;
-        if (align == 0) {
-            p = std::malloc(size);
-        }
-        else {
-            p = std::aligned_alloc(align, size);
-        }
-        return p;
-    }
-
-    static void status() {
-        printf("%d allocations for %zu bytes\n", numMalloc, sumSize);
-    }
-
-private:
-    static inline int numMalloc = 0;
-    static inline size_t sumSize = 0;
-};
-
-[[nodiscard]]
-void* operator new (std::size_t size) {
-    return TrackNew::allocate(size, 0, "::new");
-}
-[[nodiscard]]
-void* operator new (std::size_t size, std::align_val_t align) {
-    return TrackNew::allocate(size, static_cast<std::size_t>(align), "::new aligned");
-}
-[[nodiscard]]
-void* operator new[] (std::size_t size) {
-    return TrackNew::allocate(size, 0, "::new[]");
-}
-[[nodiscard]]
-void* operator new[] (std::size_t size, std::align_val_t align) {
-    return TrackNew::allocate(size, static_cast<std::size_t>(align), "::new[] aligned");
-}
-
-void operator delete (void* p) noexcept {
-    std::free(p);
-}
-void operator delete (void* p, std::size_t) noexcept {
-    ::operator delete(p);
-}
-void operator delete (void* p, std::align_val_t) noexcept {
-    std::free(p);       // C++17 API
-}
-void operator delete (void* p, std::size_t, std::align_val_t align) noexcept {
-    ::operator delete(p, align);
-}
+#include "track_new_delete.h"
 
 struct A {
     A(int i) : val(i) {
-        std::cout << "A constructed\n";
     }
     ~A() {
-        std::cout << "A deconstructed\n";
     }
     uint32_t val;
 };
@@ -112,47 +56,70 @@ struct MockResource : public ::std::pmr::memory_resource {
 struct B {
     uint64_t a;
     uint64_t b;
+    uint64_t c;
 };
 
 int main() {
-    std::cout << "sizeof std::string: " << sizeof(std::string) << std::endl;
+    std::cout << "sizeof A: " << sizeof(A) << std::endl;
+    std::cout << "sizeof B: " << sizeof(B) << std::endl;
+    std::cout << "sizeof shared_ptr<A>: " << sizeof(std::shared_ptr<A>) << std::endl; // 成员包括两个指针，所以是16B
+    std::cout << "sizeof shared_ptr<B>: " << sizeof(std::shared_ptr<B>) << std::endl; // 同上
     {
-        std::cout << "----------" << std::endl;
-        std::cout << "sizeof shared_ptr: " << sizeof(std::shared_ptr<B>) << std::endl;
         B* pi = new B();
         TrackNew::reset();
-        std::shared_ptr<B> spa(pi);
-        TrackNew::status();
-        std::cout << "sizeof shared_ptr: " << sizeof(spa) << std::endl;
+        std::shared_ptr<B> spa(pi, [](auto&& p) { delete (B*)p; });
+        TrackNew::status("construct shared B with raw ptr");
     }
     {
-        std::cout << "----------" << std::endl;
-        TrackNew::reset();
         A* pa = new A(1);
-        std::shared_ptr<A> spa{pa, [](auto&& p) {delete (A*)p;}};
-        TrackNew::status();
+        TrackNew::reset();
+        std::shared_ptr<A> spa{pa};
+        TrackNew::status("construct shared A with raw ptr");
     }
     {
-        std::cout << "----------" << std::endl;
         TrackNew::reset();
         A* pa = new A(1);
-        TrackNew::status();
+        TrackNew::status("new raw A ptr");
         delete pa;
     }
     {
-        std::cout << "----------" << std::endl;
         TrackNew::reset();
-        std::shared_ptr<B> pa = std::make_shared<B>();
-        TrackNew::status();
+        std::shared_ptr<A> pa = std::make_shared<A>(1);
+        TrackNew::status("make shared A");
     }
     {
-        std::cout << "----------" << std::endl;
+        TrackNew::reset();
+        B* pb = new B();
+        TrackNew::status("new raw B ptr");
+        delete pb;
+    }
+    {
+        TrackNew::reset();
+        std::shared_ptr<B> pa = std::make_shared<B>();
+        // show_memory(reinterpret_cast<unsigned char*>(&pa), 40);
+        TrackNew::status("make shared B");
+    }
+    {
+        TrackNew::reset();
+        std::pmr::polymorphic_allocator<A> alloc(std::pmr::new_delete_resource());
+        std::shared_ptr<A> pa = std::allocate_shared<A>(alloc, 1);
+        TrackNew::status("allocate_shared A");
+    }
+    {
+        TrackNew::reset();
+        std::pmr::polymorphic_allocator<B> alloc(std::pmr::new_delete_resource());
+        std::shared_ptr<B> pa = std::allocate_shared<B>(alloc);
+        TrackNew::status("allocate_shared B");
+    }
+    {
         TrackNew::reset();
         MockResource res;
         {
-            std::pmr::polymorphic_allocator<A> alloc(&res);
+            std::pmr::polymorphic_allocator<B> alloc(&res);
+            std::cout << "total allocated size: " << res.total_allocated_size << std::endl;
             std::cout << "size of alloc: " << sizeof(alloc) << std::endl;
-            std::shared_ptr<A> pa = std::allocate_shared<A>(alloc, 1);
+            std::shared_ptr<B> pa = std::allocate_shared<B>(alloc);
+            // show_memory(reinterpret_cast<unsigned char*>(&pa), res.total_allocated_size);
         }
         std::cout << "allocated: " << std::boolalpha << res.allocate_called << std::endl;
         std::cout << "deallocated: " << std::boolalpha << res.deallocate_called << std::endl;
